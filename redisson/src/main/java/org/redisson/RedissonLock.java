@@ -172,6 +172,7 @@ public class RedissonLock extends RedissonBaseLock {
     private <T> RFuture<Long> tryAcquireAsync(long waitTime, long leaseTime, TimeUnit unit, long threadId) {
         RFuture<Long> ttlRemainingFuture;
         if (leaseTime != -1) {
+            // 实质是异步执行加锁Lua脚本
             ttlRemainingFuture = tryLockInnerAsync(waitTime, leaseTime, unit, threadId, RedisCommands.EVAL_LONG);
         } else {
             ttlRemainingFuture = tryLockInnerAsync(waitTime, internalLockLeaseTime,
@@ -217,15 +218,18 @@ public class RedissonLock extends RedissonBaseLock {
 
     @Override
     public boolean tryLock(long waitTime, long leaseTime, TimeUnit unit) throws InterruptedException {
+        // 获取锁能容忍的最大等待时长
         long time = unit.toMillis(waitTime);
         long current = System.currentTimeMillis();
+        //取得当前线程id（判断是否可重入锁的关键）
         long threadId = Thread.currentThread().getId();
+        // 【核心点1】尝试获取锁，若返回值为null，则表示已获取到锁
         Long ttl = tryAcquire(waitTime, leaseTime, unit, threadId);
         // lock acquired
         if (ttl == null) {
             return true;
         }
-        
+        // 还可以容忍的等待时长=获取锁能容忍的最大等待时长 - 执行完上述操作流程的时间
         time -= System.currentTimeMillis() - current;
         if (time <= 0) {
             acquireFailed(waitTime, unit, threadId);
@@ -233,7 +237,15 @@ public class RedissonLock extends RedissonBaseLock {
         }
         
         current = System.currentTimeMillis();
+        // 【核心点2】订阅解锁消息，见org.redisson.pubsub.LockPubSub#onMessage
+        /**
+         * 4.订阅锁释放事件，并通过await方法阻塞等待锁释放，有效的解决了无效的锁申请浪费资源的问题：
+         * 基于信息量，当锁被其它资源占用时，当前线程通过 Redis 的 channel 订阅锁的释放事件，一旦锁释放会发消息通知待等待的线程进行竞争
+         * 当 this.await返回false，说明等待时间已经超出获取锁最大等待时间，取消订阅并返回获取锁失败
+         * 当 this.await返回true，进入循环尝试获取锁
+         */
         RFuture<RedissonLockEntry> subscribeFuture = subscribe(threadId);
+        //await 方法内部是用CountDownLatch来实现阻塞，获取subscribe异步执行的结果（应用了Netty 的 Future）
         if (!subscribeFuture.await(time, TimeUnit.MILLISECONDS)) {
             if (!subscribeFuture.cancel(false)) {
                 subscribeFuture.onComplete((res, e) -> {
@@ -246,6 +258,7 @@ public class RedissonLock extends RedissonBaseLock {
             return false;
         }
 
+        // 订阅成功
         try {
             time -= System.currentTimeMillis() - current;
             if (time <= 0) {
@@ -269,6 +282,12 @@ public class RedissonLock extends RedissonBaseLock {
 
                 // waiting for message
                 currentTime = System.currentTimeMillis();
+
+                // 【核心点3】根据锁TTL，调整阻塞等待时长；
+                // 注意：这里实现非常巧妙，
+                // 1、latch其实是个信号量Semaphore，调用其tryAcquire方法会让当前线程阻塞一段时间，避免了在while循环中频繁请求获取锁；
+                //2、该Semaphore的release方法，会在订阅解锁消息的监听器消息处理方法org.redisson.pubsub.LockPubSub#onMessage调用；
+                // 当其他线程释放了占用的锁，会广播解锁消息，监听器接收解锁消息，并释放信号量，最终会唤醒阻塞在这里的线程。
                 if (ttl >= 0 && ttl < time) {
                     subscribeFuture.getNow().getLatch().tryAcquire(ttl, TimeUnit.MILLISECONDS);
                 } else {
