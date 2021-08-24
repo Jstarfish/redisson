@@ -566,7 +566,7 @@ public class ClusterConnectionManager extends MasterSlaveConnectionManager {
                     continue;
                 }
                 masterFound = true;
-                // current master marked as failed
+                // skip master if it is not marked as failed or has no slots
                 if (!newPart.isMasterFail() || newPart.getSlotsAmount() == 0) {
                     continue;
                 }
@@ -593,7 +593,7 @@ public class ClusterConnectionManager extends MasterSlaveConnectionManager {
                 break;
             }
 
-            if (!masterFound && newPart.getSlotsAmount() > 0) {
+            if (!masterFound && !newPart.isMasterFail() && newPart.getSlotsAmount() > 0) {
                 addedPartitions.put(newPart.getMasterAddress(), newPart);
             }
         }
@@ -767,7 +767,9 @@ public class ClusterConnectionManager extends MasterSlaveConnectionManager {
     private Collection<ClusterPartition> parsePartitions(List<ClusterNodeInfo> nodes) {
         Map<String, ClusterPartition> partitions = new HashMap<>();
         for (ClusterNodeInfo clusterNodeInfo : nodes) {
-            if (clusterNodeInfo.containsFlag(Flag.NOADDR) || clusterNodeInfo.containsFlag(Flag.HANDSHAKE)) {
+            if (clusterNodeInfo.containsFlag(Flag.NOADDR)
+                    || clusterNodeInfo.containsFlag(Flag.HANDSHAKE)
+                        || clusterNodeInfo.getAddress() == null) {
                 // skip it
                 continue;
             }
